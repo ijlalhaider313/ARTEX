@@ -1,66 +1,66 @@
 # ARTEX `/btw`
 
-普通聊天、任务 MainAgent 和当前任务自己的 Worker 支持独立旁路提问。主输入框输入 `/btw 问题` 即可提交，空 `/btw` 或“旁路提问”按钮打开历史。桌面使用可调整宽度的侧栏，移动端使用 Drawer。
+Regular chat, task MainAgent, and the current task's own Worker support independent side-channel questions. Enter `/btw question` in the main input box to submit; an empty `/btw` or the "Side Question" button opens the history. Desktop uses a resizable sidebar, mobile uses a Drawer.
 
-旁路回答根据提交时的 Agent 上下文快照生成，支持流式显示、追问、停止和清空。关闭面板、刷新页面或断开 SSE 都不会取消模型请求。停止只影响当前旁路；清空会取消旁路并删除旁路历史，同时保留主上下文快照。
+Side-channel answers are generated from the Agent context snapshot at submission time, supporting streaming display, follow-up questions, stop, and clear. Closing the panel, refreshing the page, or disconnecting SSE does not cancel the model request. Stop only affects the current side-channel; clear cancels the side-channel and deletes side-channel history while retaining the main context snapshot.
 
-## 实现边界
+## Implementation Boundaries
 
-沿用 Go、norma v0.3.7、Next.js、现有 Markdown / ResizablePanel / Drawer / AlertDialog 组件；没有修改 norma 源码或为旁路添加依赖。Planner、继承自其他任务的 Worker、工具型子任务升级不在本次范围内。
+Uses Go, norma v0.3.7, Next.js, and existing Markdown / ResizablePanel / Drawer / AlertDialog components; no modifications to norma source code or new dependencies added for side-channel. Planner, Workers inherited from other tasks, and tool-type subtask upgrades are out of scope.
 
 ```mermaid
 flowchart LR
-    A[主 Agent QueryDeps] --> B[实际 Provider 绑定]
-    B --> C[不可变结构化快照]
-    B --> D[主 Agent 正常工具循环]
-    C --> E[(PostgreSQL 最新快照)]
-    E --> F[快照 + 最近成功旁路问答 + 问题]
-    F --> G[SideQuestionService 单次 Provider 请求]
-    G --> H[(独立旁路历史和用量)]
-    H --> I[累计回答 SSE / 旁路面板]
+    A[Main Agent QueryDeps] --> B[Actual Provider Binding]
+    B --> C[Immutable Structured Snapshot]
+    B --> D[Main Agent Normal Tool Loop]
+    C --> E[(PostgreSQL Latest Snapshot)]
+    E --> F[Snapshot + Recent Successful Side Q&A + Question]
+    F --> G[SideQuestionService Single Provider Request]
+    G --> H[(Independent Side History and Usage)]
+    H --> I[Accumulated Answer SSE / Side Panel]
 ```
 
-- `capture.go` 只在 `Options.Deps.CallModel / CallModelSync` 标记主循环请求。Provider 装饰器位于具体模型内部、路由池外层选择之后，因此记录实际选中的模型；压缩和摘要请求不覆盖快照。
-- 请求开始、完整模型回复、运行终态发布快照。正在生成的半段回复不发布；工具调用通过 norma 的 `MessagesForAPI` 保持配对，工具结果在下一次主模型请求或运行终态进入快照。流式中止保留上一个有效边界。
-- 快照通过 JSON 深拷贝保留结构化消息、系统提示、工具定义及生成参数。模型推理不持有快照锁或数据库事务。
-- `SideQuestionService` 调用具体 Provider；必要时先生成旁路摘要，最终回答仅在首次上下文超限且尚未输出文本/工具调用时允许缩减后重试一次。不创建 agent session，不接入工具执行器、主 transcript、活动流或任务图，也不经过任务模型切换链。回答保留工具定义是为兼容既有结构化工具上下文；摘要请求不提供工具。新返回的工具调用没有执行路径。
-- 每个父会话一个运行请求，单个服务进程最多四个，单次超时 120 秒。旁路使用服务生命周期下的独立取消上下文。
-- 旁路请求保留模型配置引用和非敏感身份摘要；请求时从现有配置取得凭据。配置被删除，或模型、协议、地址等身份字段变化，要求先运行主 Agent 更新快照。测试不会改变产品默认模型。
+- `capture.go` only marks main-loop requests at `Options.Deps.CallModel / CallModelSync`. The provider decorator sits inside the concrete model, after the routing pool's outer selection, so it records the actually selected model; compaction and summary requests do not overwrite the snapshot.
+- A snapshot is published at request start, complete model reply, and run terminal state. A half-generated reply is not published; tool calls stay paired through norma's `MessagesForAPI`, and tool results enter the snapshot at the next main model request or run terminal state. Stream abort retains the last valid boundary.
+- The snapshot deep-copies via JSON to preserve structured messages, system prompts, tool definitions, and generation parameters. Model inference does not hold the snapshot lock or a database transaction.
+- `SideQuestionService` calls the concrete provider; it generates a side-channel summary first when needed, and the final answer only allows a single retry-after-reduction when the first context-over-limit error occurs and no text/tool call has been output yet. It does not create an agent session, does not connect to the tool executor, main transcript, activity stream, or task graph, and does not go through the task model switch chain. The answer retains tool definitions for compatibility with existing structured tool context; summary requests do not provide tools. Newly returned tool calls have no execution path.
+- One running request per parent session, at most four per service process, with a 120-second timeout per call. Side-channel uses an independent cancel context under the service lifecycle.
+- The side-channel request retains a model configuration reference and a non-sensitive identity summary; credentials are obtained from the existing configuration at request time. If the configuration is deleted, or identity fields such as model, protocol, or address change, the main Agent must be run first to update the snapshot. Tests do not change the product default model.
 
-## 持久化和恢复
+## Persistence and Recovery
 
-`db/schema.sql` 自动创建 `side_question_sessions` 和 `side_question_requests`。前者保存父资源、最新快照、运行编号、版本和清理版本；后者保存问题、累计回答、状态、模型、快照时间、用量、事件序号和分页序号。
+`db/schema.sql` auto-creates `side_question_sessions` and `side_question_requests`. The former stores parent resource, latest snapshot, run number, version, and cleanup version; the latter stores question, accumulated answer, status, model, snapshot time, usage, event ordinal, and pagination ordinal.
 
-父会话键使用 conversation ID，或 task ID + exploration ID + intent ID。Worker 不使用可复用的执行槽位命名。
+The parent session key uses conversation ID, or task ID + exploration ID + intent ID. Workers do not use reusable execution-slot naming.
 
-快照按父会话合并写入，每 250 ms 刷新一次，数据库比较 `(run_id, version)` 防止旧版本覆盖。旁路提交前再次保存选定快照。成功保存后释放内存中的大快照；失败时保留待写版本。回答累计内容在流式事件到来时最多每 250 ms 写入一次，终态立即保存并在数据库错误时有限重试。
+Snapshots are merged and written per parent session, flushed at most every 250 ms, with the database comparing `(run_id, version)` to prevent old versions from overwriting. The selected snapshot is saved again before side-channel submission. After a successful save, the large in-memory snapshot is released; on failure, the pending version is retained. Accumulated answer content is written at most every 250 ms as streaming events arrive, with terminal state saved immediately and a limited retry on database error.
 
-服务启动将遗留 `running` 请求标记为 `interrupted`，保留已落库的部分回答和用量，不自动重放请求。最近成功保存的上下文可直接用于下一次提问。旧会话没有快照时要求先运行主 Agent，不从 UI 活动记录重建上下文。
+On service startup, leftover `running` requests are marked `interrupted`, retaining the already-persisted partial answers and usage, without automatically replaying requests. The most recently successfully saved context can be used directly for the next question. Old sessions without a snapshot require running the main Agent first; context is not reconstructed from UI activity records.
 
-清空操作递增清理版本并删除请求；条件更新阻止迟到的回调重新写回。物理父资源删除依靠外键级联，Worker 逻辑删除在同一事务中删除旁路数据，并拒绝后续迟到快照。任务归档先阻止新请求、等待主流程停止、取消并等待旁路落库；归档格式为 v3，同时兼容不含旁路表的 v1/v2。
+The clear operation increments the cleanup version and deletes requests; a conditional update prevents late callbacks from writing back. Physical parent resource deletion relies on foreign-key cascade; Worker logical deletion deletes side-channel data in the same transaction and rejects subsequent late snapshots. Task archiving first blocks new requests, waits for the main flow to stop, cancels and waits for side-channel persistence; the archive format is v3, backward-compatible with v1/v2 that do not contain side-channel tables.
 
-历史完整保存，按序号游标每页最多返回 20 条。模型请求最多回放最近 20 组成功问答原文，同时按 token 预算限制回放量；较旧问答维护独立滚动摘要。主上下文超预算时仅摘要旁路副本的旧部分，保留近期结构化工具调用与结果。摘要、准备进度与用量一起纳入旁路的并发、取消和 120 秒超时限制。详见 [上下文预算与开源参考](CONTEXT_BUDGET.md)。
+History is fully preserved, returning at most 20 items per page by ordinal cursor. Model requests replay at most the 20 most recent successful Q&A pairs in original text, while limiting replay by token budget; older Q&A maintains an independent rolling summary. When the main context exceeds budget, only the old portion of the side-channel copy is summarized, retaining recent structured tool calls and results. Summary, preparation progress, and usage are all subject to the side-channel's concurrency, cancellation, and 120-second timeout limits. See [Context Budget and Open-Source References](CONTEXT_BUDGET.md).
 
-## HTTP 契约
+## HTTP Contract
 
-以下路径作为 `{parent}`，沿用现有认证及资源校验：
+The following paths serve as `{parent}`, reusing existing authentication and resource validation:
 
 - `/api/conversations/{id}`
 - `/api/tasks/{id}/chat`
 - `/api/tasks/{id}/intents/{iid}`
 
-| 请求 | 返回及行为 |
+| Request | Response and Behavior |
 | --- | --- |
-| `GET {parent}/side-questions?before={ordinal}` | `items` 按新到旧排列、独立 `current` 运行状态、`snapshot` 元信息、`next_cursor`；游标为 0 表示最新页 / 无下一页 |
-| `POST {parent}/side-questions` | JSON `{ "question": "…", "client_request_id": "UUID" }`；新请求返回 202 及请求对象；相同 ID 和问题返回既有对象 200 |
-| `DELETE {parent}/side-questions` | 取消并清空当前父会话的旁路问答 |
-| `GET /api/side-questions/{requestID}/events` | `snapshot` SSE 事件，`id` 为递增序号，`data` 为完整累计请求对象；清空时发送 `cleared` |
-| `POST /api/side-questions/{requestID}/cancel` | 显式取消；终态可从历史或 SSE 读取 |
+| `GET {parent}/side-questions?before={ordinal}` | `items` newest-first, independent `current` run status, `snapshot` metadata, `next_cursor`; cursor 0 means latest page / no next page |
+| `POST {parent}/side-questions` | JSON `{ "question": "…", "client_request_id": "UUID" }`; new request returns 202 with the request object; same ID and question returns existing object 200 |
+| `DELETE {parent}/side-questions` | Cancel and clear the current parent session's side-channel Q&A |
+| `GET /api/side-questions/{requestID}/events` | `snapshot` SSE events, `id` is an incrementing ordinal, `data` is the full accumulated request object; sends `cleared` on clear |
+| `POST /api/side-questions/{requestID}/cancel` | Explicit cancel; terminal state readable from history or SSE |
 
-问题上限 4000 字符。无快照、模型配置变化、同一父会话忙或幂等 ID 冲突返回 409；全局并发上限返回 429。每次 SSE 连接都先发送累计状态，不依赖客户端之前收到的文本片段。前端按请求 ID + 序号合并，并在切换父会话、清空时废弃旧回调。
+Question limit is 4000 characters. No snapshot, model configuration change, same parent session busy, or idempotent ID conflict returns 409; global concurrency limit returns 429. Each SSE connection sends the accumulated state first, not relying on text fragments the client may have previously received. The frontend merges by request ID + ordinal, and discards old callbacks when switching parent sessions or clearing.
 
-## 验证与参考
+## Validation and References
 
-自动化检查、实际模型使用及已知限制见 [VALIDATION.md](VALIDATION.md)。
+Automated checks, actual model usage, and known limitations are in [VALIDATION.md](VALIDATION.md).
 
-独立请求参考 [Grok CLI side-question.ts（固定提交）](https://github.com/superagent-ai/grok-cli/blob/fb97af83f06dca873281d60168430f06c8de6324/src/utils/side-question.ts)，运行隔离参考 [OpenCode（固定提交）](https://github.com/anomalyco/opencode/tree/b3f1a96c6dd7adeb28b36dd11add1998fc84d67b)。ARTEX 的上下文使用 norma 的结构化消息，未采用从前端日志拼接文本的方式。
+For the standalone request approach, see [Grok CLI side-question.ts (pinned commit)](https://github.com/superagent-ai/grok-cli/blob/fb97af83f06dca873281d60168430f06c8de6324/src/utils/side-question.ts); for runtime isolation, see [OpenCode (pinned commit)](https://github.com/anomalyco/opencode/tree/b3f1a96c6dd7adeb28b36dd11add1998fc84d67b). ARTEX's context uses norma's structured messages, not the approach of concatenating text from frontend logs.
